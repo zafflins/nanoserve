@@ -1,34 +1,16 @@
 import sys, types
 import socket, selectors
-from nanoserve.proto.proto import NanoProtocol
 
-NANO_SERVER_METHOD_MAX: int = 255
-
-class NanoSession:
-    def __init__(self, fileObject: socket.socket, address: tuple[str, int], blocking: bool=False) -> None:
-        self.dataIn: dict = {}
-        self.dataOut: dict = {}
-        self.fileObject: socket.socket = fileObject
-        self.fileObject.setblocking(blocking)
-        self.address: tuple[str, int] = address
-
-    def write(self, stream: bytes|bytearray) -> None:
-        sent = 0
-        size = len(stream)
-        while sent < size:
-            sent += self.fileObject.send(stream[sent:])
-
-def NanoServerMethod(methodID: int) -> callable:
-    def wrapper(method: callable):
-        setattr(method, "methodID", methodID)
-        return method
-    return wrapper
+from .router import NanoRouter
+from .session import NanoSession
+from ..proto.proto import NanoProtocol
 
 class NanoServer:
-    def __init__(self, name: str, host: str, port: int, proto: NanoProtocol) -> None:
+    def __init__(self, name: str, host: str, port: int, proto: NanoProtocol, router: NanoRouter) -> None:
         self.name: str = str(name)
         self.host: str = str(host)
         self.port: int = int(port)
+        self.router: NanoRouter = router
         self.proto: NanoProtocol = proto()
         self.address: tuple[str, int] = (self.host, self.port)
 
@@ -36,24 +18,9 @@ class NanoServer:
         self.running: bool = True
         
         self.serverObjects: list[NanoSession] = []
-        self.serverMethods: list[callable] = [None] * NANO_SERVER_METHOD_MAX
         self.selector: selectors.DefaultSelector = selectors.DefaultSelector()
         self.fileObject: socket.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    
-    def _register_methods(self) -> bool:
-        for _name, _attr in self.__class__.__dict__.items():
-            if callable(_attr) and hasattr(_attr, "methodID"):
-                methodID = _attr.methodID
-                if 0 <= methodID < NANO_SERVER_METHOD_MAX:
-                    if self.serverMethods[methodID] is not None: continue
-                    self.serverMethods[methodID] = _attr
-                    print(f"[WaveServer] registered server method: {_attr.__name__} {methodID}")
-                else:
-                    print(f"[WaveServer] failed to register server method: {_attr.__name__} {methodID}")
-                    return False
-        return True
-
-
+  
     def connect_hook(self, session: NanoSession) -> None:
         """ Subclasses should override this method for 'on connect' functionality """
         pass
@@ -81,25 +48,24 @@ class NanoServer:
         pass
     def _read(self, session: NanoSession) -> None:
         request = self.proto.decode(session.fileObject)
-        if len(request):
+        if len(request["stream"]):
             print(f"SERVER READ: {request}")
-            kind, method, size, stream = request.values()
-            serverMethod = self.serverMethods[method]
-            if callable(serverMethod): serverMethod(self, request, session)
+            self.router.dispatch(request, session)
             self.read_hook(request, session)
         else: self._disconnect(session)
 
 
-    def write_hook(self, stream: bytes|bytearray, session: NanoSession) -> None:
+    def write_hook(self, stream: bytearray, session: NanoSession) -> None:
         """ Subclasses should override this method for 'on write' functionality """
         pass
     def _write(self, session: NanoSession) -> None:
-        if len(session.dataOut):
-            stream = self.proto.encode(session.dataOut)
+        if len(session.metaOut) and len(session.streamOut):
+            stream = self.proto.encode(self.proto.protoDict(session.metaOut, session.streamOut))
             session.write(stream)
             print(f"SERVER WRITE: {stream}")
             self.write_hook(stream, session)
-            session.dataOut = {}
+            session.streamOut.clear()
+            session.metaOut.clear()
 
     # TODO: server session connection validation before r/w service
     # TODO: heartbeat?
@@ -115,13 +81,12 @@ class NanoServer:
         """ Subclasses should override this method for 'on startup' functionality. """
         pass
     def _startup(self) -> None:
-        if self._register_methods():
-            self.fileObject.bind(self.address)
-            self.fileObject.listen()
-            self.fileObject.setblocking(False)
-            self.selector.register(self.fileObject, selectors.EVENT_READ, data=None)
-            self.startup_hook()
-            print(f"SERVER STARTED: {self.name} {self.address}")
+        self.fileObject.bind(self.address)
+        self.fileObject.listen()
+        self.fileObject.setblocking(False)
+        self.selector.register(self.fileObject, selectors.EVENT_READ, data=None)
+        self.startup_hook()
+        print(f"SERVER STARTED: {self.name} {self.address}")
 
     def shutdown_hook(self) -> None:
         """ Subclasses should override this method for 'on shutdown' functionality. """

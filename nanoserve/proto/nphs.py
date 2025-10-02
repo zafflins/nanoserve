@@ -1,107 +1,109 @@
-# NPHS/impl.py
+# nanoserve/proto/nphs.py
+"""
+NPHS - OSI Layer 6 Prototcol
+- date: 10/2/25
+- author(s): @zafflins
 
-from .proto import NanoProtocol
-from nanoserve.server import NanoSession
+Packed Header: 8bit VERSION | 8bit MASK | LENGTH | METHOD
+                            | 0th bit specifies how to intepret LENGTH/METHOD
+                            | 0: 16bit LENGTH | 32bit METHOD - 64KB OSI Layer 2 frame-size
+                            | 1: 16bit METHOD | 32bit LENGTH -  4GB OSI Layer 2 frame-size
+
+Packed Header Fields:
+VERSION (8-bit) - NPHS version.
+MASK    (8-bit) - Flags for header/packet intepretation/behavior.
+LENGTH  (16/32bit) - Stream length in bytes. Can be 16-bit or 32-bit depending on 0th MASK bit.
+METHOD  (16/32bit) - Method/command ID. Can be 16-bit or 32-bit depending on 0th MASK bit.
+
+NPHS Packet: VERSION|MASK|LENGTH|METHOD|STREAM
+"""
+
 import socket
+from .proto import NanoProtocol
 
-PHS_VERSION = "1.0.0"
-
-# === NPHS REQUEST KINDS ===
-PHS_CONNECT: int       = 0x01
-PHS_HEARTBEAT: int     = 0x02
-PHS_RECONNECT: int     = 0x03
-PHS_DISCONNECT: int    = 0x04
-
-# === NPHS MAXIMUMS ===
-PHS_BUFFER_MAX: int         = 0xFFF
-PHS_METHOD_ID_MAX: int      = 0xFF
-PHS_REQUEST_KIND_MAX: int   = 0xFF
+NPHS_VERSION = 0b00000001
 
 class NPHS(NanoProtocol):
     def __init__(self) -> None:
-        super().__init__(PHS_VERSION)
+        super().__init__("NPHS", NPHS_VERSION)
 
-    def _buildHeader(self, kind: int, method: int, size: int) -> bytes:
-        if not (0 <= kind <= PHS_REQUEST_KIND_MAX):
-            print("[NPHS] invalid header kind")
-            return None
-        if not (0 <= method <= PHS_METHOD_ID_MAX):
-            print("[NPHS] invalid header method")
-            return None
-        if not (0 < size <= PHS_BUFFER_MAX):
+    def _packHeader(self, mask: int, length: int, method: int) -> bytes:
+        if mask & 0x01:
+            header = ((length & 0xFFFFFFFF) << 32) | ((method & 0xFFFF) << 16) | ((mask & 0xFF) << 8) | (NPHS_VERSION & 0xFF)
+        else:
+            header = ((method & 0xFFFFFFFF) << 32) | ((length & 0xFFFF) << 16) | ((mask & 0xFF) << 8) | (NPHS_VERSION & 0xFF)
+        return header.to_bytes(8, byteorder="big")
+
+    def _unpackHeader(self, header: bytes) -> list[int] | None:
+        if len(header) != 8:
             print("[NPHS] invalid header size")
             return None
-        header = ((size & 0xFFFF) << 16) | ((method & 0xFF) << 8) | (kind & 0xFF)
-        return header.to_bytes(4, byteorder="big")
+        h = int.from_bytes(header, "big")
+        version = h & 0xFF
+        mask = ((h >> 8) & 0xFF)
+        if mask & 0x01:
+            method = ((h >> 16) & 0xFFFF)
+            length = ((h >> 32) & 0xFFFFFFFF)
+        else:
+            length = ((h >> 16) & 0xFFFF)
+            method = ((h >> 32) & 0xFFFFFFFF)
+        return [version, mask, length, method]
 
-    def _parseHeader(self, header: bytes) -> tuple[int, int, int] | None:
-        if len(header) != 4:
-            print("[NPHS] invalid header size")
-            return {}
-        buffer = int.from_bytes(header, "big")
-        kind   = buffer & 0xFF
-        method = (buffer >> 8) & 0xFF
-        size   = (buffer >> 16) & 0xFFFF
-        return kind, method, size
-
-    # validate request kind + method for u8 overflow
     def encode(self, data: dict) -> bytes:
-        # data = {"kind": int, "method": int, "size": int "stream": bytearray}
-        header = self._buildHeader(data["kind"], data["method"], data["size"])
-        if header is None:
-            print(f"[NPHS] failed to build header: (header){header}")
-            return {}
-        if len(data["stream"]) != data["size"]:
-            print(f"[NPHS] stream size mismatch in build_request: (size){len(data["stream"])} (expected){data["size"]}")
-            return {}
-        
-        return header + data["stream"]
+        meta = data["meta"]
+        stream = bytes(data["stream"])
+        header = self._packHeader(meta["mask"], meta["length"], meta["method"])
+        if len(stream) != meta["length"]:
+            print(f"[NPHS] stream length mismatch during encode: (length){len(stream)} (expected){meta["length"]}")
+            return b""
+        return header + stream
 
     def decode(self, fileObject: socket.socket) -> dict:
         if fileObject.fileno() == -1:
             print("[NPHS] attempted to operate on closed socket")
-            return (PHS_DISCONNECT, 0, 0, b"\0")
+            return self.protoDict([], bytes(0))
         try:
-            header = fileObject.recv(4)
-            if len(header) < 4:
-                return {}
+            header = fileObject.recv(8)
+            if len(header) < 8:
+                return self.protoDict([], bytes(0))
 
-            parsed = self._parseHeader(header)
-            if parsed is None:
+            h = self._unpackHeader(header)
+            if h is None:
                 print("[NPHS] invalid header parsed")
-                return {}
-            kind, method, size = parsed
+                return self.protoDict([], bytes(0))
 
-            body = bytearray()
-            while len(body) < size:
-                chunk = fileObject.recv(size - len(body))
+            version, mask, length, method = h
+
+            stream = b""
+            while len(stream) < length:
+                chunk = fileObject.recv(length - len(stream))
                 if not chunk:
                     print("[NPHS] connection dropped mid-stream")
-                    return (PHS_DISCONNECT, 0, 0, b"\0")
-                body += chunk
+                    return self.protoDict([], bytes(0))
+                stream += chunk
 
-            return {"kind": kind, "method": method, "size": size, "stream": bytes(body)}
+            return self.protoDict(h, stream) 
         except OSError as e:
             print(f"[NPHS] client connection aborted")
-            return {}
+            return self.protoDict([], bytes(0))
         except TimeoutError:
             print(f"[NPHS] client connection timeout")
-            return (PHS_DISCONNECT, 0, 0, b"\0")
+            return self.protoDict([], bytes(0))
         except BlockingIOError:
             print(f"[NPHS] client blocking error")
-            return (PHS_DISCONNECT, 0, 0, b"\0")
+            return self.protoDict([], bytes(0))
         except (KeyboardInterrupt, Exception) as e:
             print(f"[NPHS] unknown exception: {e}")
-            return (PHS_DISCONNECT, 0, 0, b"\0")
+            return self.protoDict([], bytes(0))
         except ConnectionRefusedError as e:
             print(f"[NPHS] client connection refused")
-            return {}
+            return self.protoDict([], bytes(0))
         except ConnectionAbortedError as e:
             print(f"[NPHS] client connection aborted")
-            return {}
+            return self.protoDict([], bytes(0))
         except ConnectionResetError as e:
             print(f"[NPHS] client connection reset")
-            return {}
+            return self.protoDict([], bytes(0))
         except ConnectionError as e:
             print(f"[NPHS] client connection error")
-            return {}
+            return self.protoDict([], bytes(0))
