@@ -20,7 +20,7 @@ class NanoRouter:
                     print(f"[NanoRouter] route not-registered: {method}")
                     return
                 else:
-                    if callable(route["hook"]): route["hook"](route["hook"], request, session, route["args"])
+                    if callable(route["hook"]): route["hook"](request, session, route["args"])
             case _:
                 print(f"[NanoRouter] route not-registered: {method}")
                 return

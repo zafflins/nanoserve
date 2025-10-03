@@ -17,7 +17,7 @@ class NanoServer:
         self.timeout: int = 0
         self.running: bool = True
         
-        self.serverObjects: list[NanoSession] = []
+        self.sessions: list[NanoSession] = []
         self.selector: selectors.DefaultSelector = selectors.DefaultSelector()
         self.fileObject: socket.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
   
@@ -25,10 +25,9 @@ class NanoServer:
         """ Subclasses should override this method for 'on connect' functionality """
         pass
     def _connect(self, key: selectors.SelectorKey, mask: int) -> None:
-        session = NanoSession(*key.fileobj.accept())
+        session = NanoSession(len(self.sessions), *key.fileobj.accept())
         self.selector.register(session.fileObject, selectors.EVENT_READ | selectors.EVENT_WRITE, data=session)
-        self.serverObjects.append(session)
-        print(f"SERVER CONNECTION: {session.address}")
+        self.sessions.append(session)
         self.connect_hook(session)
 
     def _reconnect(self) -> None: pass
@@ -38,10 +37,9 @@ class NanoServer:
         pass
     def _disconnect(self, session: NanoSession) -> None:
         self.selector.unregister(session.fileObject)
-        self.serverObjects.remove(session)
+        self.sessions.remove(session)
         self.disconnect_hook(session)
         session.fileObject.close()
-        print(f"SERVER SESSION DISCONNECTED: {session.address}")
 
     def read_hook(self, request: dict, session: NanoSession) -> None:
         """ Subclasses should override this method for 'on read' functionality """
@@ -49,7 +47,6 @@ class NanoServer:
     def _read(self, session: NanoSession) -> None:
         request = self.proto.decode(session.fileObject)
         if len(request["stream"]):
-            print(f"SERVER READ: {request}")
             self.router.dispatch(request, session)
             self.read_hook(request, session)
         else: self._disconnect(session)
@@ -62,7 +59,6 @@ class NanoServer:
         if len(session.metaOut) and len(session.streamOut):
             stream = self.proto.encode(self.proto.protoDict(session.metaOut, session.streamOut))
             session.write(stream)
-            print(f"SERVER WRITE: {stream}")
             self.write_hook(stream, session)
             session.streamOut.clear()
             session.metaOut.clear()
@@ -70,12 +66,8 @@ class NanoServer:
     # TODO: server session connection validation before r/w service
     # TODO: heartbeat?
     def _service(self, key: selectors.SelectorKey, mask: int) -> None:
-        session = key.data
-        fileObj = key.fileobj
-        if (mask & selectors.EVENT_READ) == selectors.EVENT_READ:
-            self._read(session)
-        if (mask & selectors.EVENT_WRITE) == selectors.EVENT_WRITE:
-            self._write(session)
+        if (mask & selectors.EVENT_READ) == selectors.EVENT_READ: self._read(key.data)
+        if (mask & selectors.EVENT_WRITE) == selectors.EVENT_WRITE: self._write(key.data)
 
     def startup_hook(self) -> None:
         """ Subclasses should override this method for 'on startup' functionality. """
@@ -86,7 +78,6 @@ class NanoServer:
         self.fileObject.setblocking(False)
         self.selector.register(self.fileObject, selectors.EVENT_READ, data=None)
         self.startup_hook()
-        print(f"SERVER STARTED: {self.name} {self.address}")
 
     def shutdown_hook(self) -> None:
         """ Subclasses should override this method for 'on shutdown' functionality. """
@@ -96,7 +87,6 @@ class NanoServer:
         self.selector.close()
         self.running = False
         self.shutdown_hook()
-        print(f"SERVER SHUT DOWN: {self.name} {self.address}")
 
     def main(self) -> None:
         """ Subclasses should override this method for 'main-loop' functionality. """
@@ -114,10 +104,8 @@ class NanoServer:
                         self._service(key, mask)
             else: self._shutdown()
         except (OSError):
-            print("SERVER OS ERROR")
             self._shutdown()
         except (TimeoutError):
-            print("SERVER TIMEOUT ERROR")
             self._shutdown()
         except (KeyboardInterrupt):
             self._shutdown()

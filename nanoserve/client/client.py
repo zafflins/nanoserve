@@ -47,9 +47,12 @@ class NanoClient:
         if (mask & selectors.EVENT_WRITE) == selectors.EVENT_WRITE:
             self.write()
 
+    def read_hook(self, request: dict) -> None:
+        pass
     def read(self) -> None:
         request = self.proto.decode(self.fileObject)
         if not len(request["stream"]): self.disconnect()
+        else: self.read_hook(request)
 
     def write(self) -> None:
         if not len(self.metaOut) or not len(self.streamOut): return
