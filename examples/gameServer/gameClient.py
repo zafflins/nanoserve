@@ -3,14 +3,12 @@ import nanoserve as ns, pygame as pg
 
 class GameClient(ns.client.NanoClient):
     def __init__(self) -> None:
+        super().__init__(ns.proto.NPHS)
         
-        self.players = {}
-
+        self.players = dict()
         self.clock = pg.time.Clock()
         self.windowSize = [400, 300]
         self.window = pg.display.set_mode(self.windowSize, flags=pg.SRCALPHA)
-
-        super().__init__(ns.proto.NPHS)
 
     def read_hook(self, request: dict) -> None:
         if request["meta"][3] == 1:
